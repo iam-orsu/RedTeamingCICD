@@ -1,0 +1,106 @@
+# Deploy to Azure App Service
+# Triggered on push to main or manual dispatch
+# Last updated: anjali.v 2024-10-02
+# Uses OIDC (keyless auth) - no stored Azure credentials needed
+
+name: Deploy to Production
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: 'Force deploy even if no code changes'
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write   # required for OIDC token generation
+  contents: read
+
+jobs:
+  deploy:
+    name: Build and Deploy
+    runs-on: [self-hosted, ceruleanpay-runner, linux]
+    environment: production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          persist-credentials: true
+
+      - name: Debug - Print deployment context
+        run: |
+          echo "=== Deployment Context ==="
+          echo "Triggered by: ${{ github.actor }}"
+          echo "Ref: ${{ github.ref }}"
+          echo "SHA: ${{ github.sha }}"
+          echo "Run ID: ${{ github.run_id }}"
+          echo ""
+          echo "=== Azure Configuration ==="
+          printenv | grep -i azure
+          printenv | grep -i acr
+          printenv | grep -i docker
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ACR_NAME: ${{ secrets.ACR_NAME }}
+
+      - name: Azure Login via OIDC
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Log in to Azure Container Registry
+        run: az acr login --name ${{ secrets.ACR_NAME }}
+
+      - name: Build and push Docker image
+        run: |
+          IMAGE="${{ secrets.ACR_NAME }}.azurecr.io/payment-api"
+          SHA_TAG="${IMAGE}:${{ github.sha }}"
+          LATEST_TAG="${IMAGE}:latest"
+
+          docker build \
+            --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --build-arg GIT_COMMIT="${{ github.sha }}" \
+            --build-arg PAYMENT_API_KEY="${{ secrets.PAYMENT_API_KEY }}" \
+            -t "$SHA_TAG" \
+            -t "$LATEST_TAG" \
+            .
+
+          docker push "$SHA_TAG"
+          docker push "$LATEST_TAG"
+
+          echo "IMAGE_URI=$SHA_TAG" >> $GITHUB_ENV
+
+      - name: Deploy to App Service
+        run: |
+          az webapp config container set \
+            --name ceruleanpay-api \
+            --resource-group ceruleanpay-rg \
+            --container-image-name "$IMAGE_URI" \
+            --container-registry-url https://${{ secrets.ACR_NAME }}.azurecr.io
+
+          az webapp restart \
+            --name ceruleanpay-api \
+            --resource-group ceruleanpay-rg
+
+      - name: Wait for deployment
+        run: |
+          echo "Waiting for app to come up..."
+          sleep 30
+          curl -sf https://ceruleanpay.online/health || echo "Health check failed - check app logs"
+
+      - name: Upload deployment artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: deployment-${{ github.run_id }}
+          # Uploads full workspace - includes .git directory with cached GITHUB_TOKEN
+          path: .
+          retention-days: 90
