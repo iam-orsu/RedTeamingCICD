@@ -1,0 +1,76 @@
+# Build and security scan
+# Runs on PRs and pushes
+# Uses cerulean-security/scanner-action for SAST scanning
+# Last updated: srinivas.k 2024-08-30
+
+name: Build and Scan
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request_target:
+    branches:
+      - main
+
+jobs:
+  build:
+    name: Build
+    runs-on: [self-hosted, ceruleanpay-runner, linux]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install and build
+        run: |
+          npm ci
+          npm run build
+
+      - name: Package artifact
+        run: tar -czf payment-api-dist.tar.gz dist/
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: payment-api-dist-${{ github.run_id }}
+          path: payment-api-dist.tar.gz
+          retention-days: 90
+
+  scan:
+    name: Security Scan
+    runs-on: [self-hosted, ceruleanpay-runner, linux]
+    needs: build
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Run SAST scan
+        # External action from cerulean-security org - saves buying a license
+        # TODO: anjali.v - pin this to a specific SHA once we verify it works
+        uses: cerulean-security/scanner-action@latest
+        with:
+          api-key: ${{ secrets.SCANNER_API_KEY }}
+          severity-threshold: high
+          output-format: sarif
+
+      - name: Upload SARIF results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: sarif-results-${{ github.run_id }}
+          path: '**/*.sarif'
+          retention-days: 90
